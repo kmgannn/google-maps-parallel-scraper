@@ -1,0 +1,274 @@
+import asyncio
+import pandas as pd
+from playwright.async_api import async_playwright
+import re
+import random
+import os
+import csv
+import urllib.parse
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+import unicodedata, html
+
+# -------------------- CONFIG --------------------
+
+PLANNING_AREAS = [
+    "Ang Mo Kio", "Bedok", "Bishan", "Boon Lay", "Bukit Batok", "Bukit Merah", 
+    "Bukit Panjang", "Bukit Timah", "Changi", "Choa Chu Kang", "Clementi", 
+    "Downtown Core", "Geylang", "Hougang", "Jurong East", "Jurong West", 
+    "Kallang", "Lim Chu Kang", "Mandai", "Marine Parade", "Newton", "Novena", 
+    "Orchard", "Outram", "Pasir Ris", "Paya Lebar", "Pioneer", "Punggol", 
+    "Queenstown", "River Valley", "Rochor", "Sembawang", "Sengkang", 
+    "Serangoon", "Tampines", "Tanglin", "Toa Payoh", "Tuas", "Woodlands", "Yishun",
+    "Katong", "Chinatown", "Raffles Place", "Marina Bay"
+]
+
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# -------------------- FILE HANDLING --------------------
+
+def load_previous_results(filename):
+    if not os.path.exists(filename):
+        return [], set()
+    
+    results = []
+    seen = set()
+    with open(filename, newline='', encoding='utf-8') as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            results.append(row)
+            if "Name" in row and row["Name"] not in ('N/A', ''):
+                seen.add(row["Name"])
+            elif "Business Name" in row and row["Business Name"] not in ('N/A', ''):
+                seen.add(row["Business Name"])
+    return results, seen
+
+def save_results(filename, results):
+    if not results:
+        return
+
+    all_keys = set()
+    for row in results:
+        all_keys.update(row.keys())
+    
+    preferred_order = ["Name", "Business Name", "Address", "Phone", "Website"]
+    final_fieldnames = [f for f in preferred_order if f in all_keys]
+    for key in all_keys:
+        if key not in final_fieldnames:
+            final_fieldnames.append(key)
+
+    with open(filename, mode='w', newline='', encoding='utf-8') as file:
+        writer = csv.DictWriter(file, fieldnames=final_fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+
+def clean_text(value: str) -> str:
+    if not value:
+        return "N/A"
+    # Decode HTML entities and normalize unicode
+    return unicodedata.normalize("NFKC", html.unescape(value.strip()))
+
+# -------------------- SCRAPER UTILS --------------------
+
+
+async def scroll_results(page, scroll_timeout=60):
+    print("Scrolling to load all results...")
+    try:
+        # Wait for the feed element to be present
+        await page.wait_for_selector('div[role="feed"]', timeout=15000)
+        feed_element = await page.query_selector('div[role="feed"]')
+        
+        start_time = asyncio.get_event_loop().time()
+        previous_height = 0
+        while asyncio.get_event_loop().time() - start_time < scroll_timeout:
+            # Scroll the feed element
+            await page.evaluate('(feed) => { feed.scrollTo(0, feed.scrollHeight); }', feed_element)
+            await asyncio.sleep(3) # Give time for content to load
+            new_height = await page.evaluate('(feed) => feed.scrollHeight', feed_element)
+            if new_height == previous_height:
+                break
+            previous_height = new_height
+        print(f"Finished scrolling. Current scroll height: {previous_height}")
+    except Exception as e:
+        print(f"Scroll error: {e}")
+
+async def extract_details(page, business_url):
+    business_data = {
+        "Name": "N/A",
+        "Address": "N/A",
+        "Phone": "N/A",
+        "Website": "N/A"
+    }
+
+    try:
+        await page.goto(business_url, timeout=30000, wait_until="domcontentloaded")
+        await asyncio.sleep(random.uniform(3, 5))
+
+        # Get business name
+        name_element = await page.query_selector('h1.DUwDvf.lfPIob') or \
+                       await page.query_selector('h1[role="heading"]')
+        if name_element:
+            business_data["Name"] = clean_text(await name_element.inner_text())
+
+        # Collect info items
+        info_items = await page.query_selector_all('button[data-item-id], div.AeaXub')
+
+        for item in info_items:
+            # Prefer aria-label if present
+            aria = await item.get_attribute("aria-label")
+            text = await item.inner_text()
+            content = clean_text(aria if aria else text)
+
+            if "Address" in content:
+                business_data["Address"] = content.replace("Address:", "").strip()
+            elif "Phone" in content:
+                business_data["Phone"] = content.replace("Phone:", "").strip()
+            elif "." in content and " " not in content and "/" in content or ".com" in content:
+                # crude filter for domains/URLs
+                business_data["Website"] = content
+
+    except Exception as e:
+        print(f"Error extracting details for {business_url}: {e}")
+        return None
+
+    return business_data
+
+# Helper function to wrap extract_details with the inner semaphore and page creation/closure
+async def extract_details_with_semaphore(browser_context, url, seen_names, all_results, save_path, semaphore_inner):
+    async with semaphore_inner:
+        details_page = None
+        try:
+            details_page = await browser_context.new_page()
+            data = await extract_details(details_page, url)
+            
+            if data and data["Name"] != "N/A" and data["Name"] not in seen_names:
+                all_results.append(data)
+                seen_names.add(data["Name"])
+                save_results(save_path, all_results)
+                print(f"[{len(all_results)}] ✅ {data['Name']} | Address: {data['Address']} | Phone: {data['Phone']} | Website: {data['Website']}")
+            elif data and data["Name"] != "N/A":
+                print(f"[{len(all_results)}] ⏭️ Skipped duplicate: {data['Name']}")
+            else:
+                print(f"[{len(all_results)}] ❌ Skipped invalid/no name for URL: {url}")
+
+        except Exception as e:
+            print(f"Error in extract_details_with_semaphore for {url}: {e}")
+        finally:
+            if details_page:
+                await details_page.close()
+            await asyncio.sleep(random.uniform(2.5, 5))
+
+async def scrape_area_keyword(browser_context, area, keyword, seen_names, all_results, save_path, semaphore_outer, semaphore_inner):
+    search_query = f"{keyword} in {area} Singapore"
+    print(f"\n🔍 Searching: {search_query}")
+    
+    async with semaphore_outer:
+        page = None
+        try:
+            page = await browser_context.new_page()
+            
+            # Navigate to the correct Google Maps URL
+            encoded_query = urllib.parse.quote_plus(search_query)
+            await page.goto(f"https://www.google.com/maps/search/{encoded_query}", timeout=60000)
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(random.uniform(5, 8))
+
+            await scroll_results(page)
+
+            # Collect all business listing links
+            # We look for links within a div[role="feed"] that contain the '/maps/place/' part of the URL
+            listing_links = await page.query_selector_all('div[role="feed"] a[href*="/maps/place/"]')
+            
+            business_urls = []
+            for link_element in listing_links:
+                url = await link_element.get_attribute('href')
+                if url:
+                    # Check if the parent container is a sponsored ad
+                    # This selector is a guess and may need adjustment
+                    is_sponsored_ad = await link_element.evaluate('el => { return !!el.closest("div[aria-label*=\\"Sponsored\\"]"); }')
+                    
+                    if not is_sponsored_ad:
+                        business_urls.append(url)
+                    else:
+                        print("Skipping sponsored listing.")
+
+            print(f"🗂 Found {len(business_urls)} organic listings for '{search_query}'")
+
+            detail_extraction_tasks = []
+            for url in business_urls:
+                detail_extraction_tasks.append(
+                    asyncio.create_task(
+                        extract_details_with_semaphore(browser_context, url, seen_names, all_results, save_path, semaphore_inner)
+                    )
+                )
+            
+            await asyncio.gather(*detail_extraction_tasks)
+
+        except PlaywrightTimeoutError:
+            print(f"Timeout error for search '{search_query}'. Skipping.")
+        except Exception as e:
+            print(f"Error during search '{search_query}': {e}")
+        finally:
+            if page:
+                await page.close()
+
+# -------------------- ENTRY POINT --------------------
+
+async def main():
+    business_type = input("Enter business type (e.g. cafe, plumber): ").strip().lower()
+    city = input("Enter the city (e.g., Singapore, Kuala Lumpur): ").strip()
+    
+    print("Add additional keywords if any (press Enter to skip):")
+    keywords = [business_type]
+    while True:
+        kw = input("Keyword: ").strip()
+        if not kw:
+            break
+        keywords.append(kw)
+    keywords = list(set(keywords))
+
+    progress_file = f"{business_type}_{city.replace(' ', '_')}_progress.csv"
+    final_output_file = f"{business_type}_{city.replace(' ', '_')}_results.csv"
+
+    all_results, seen_names = load_previous_results(progress_file)
+    print(f"Loaded {len(all_results)} previous results. Seen names: {len(seen_names)}")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False, args=['--disable-gpu', '--no-sandbox', '--disable-setuid-sandbox'])
+        context = await browser.new_context(user_agent=DEFAULT_USER_AGENT)
+
+        try:
+            target_areas = PLANNING_AREAS if city.lower() == "singapore" else [city]
+
+            semaphore_outer = asyncio.Semaphore(3)
+            semaphore_inner = asyncio.Semaphore(3)
+
+            tasks = []
+            for area in target_areas:
+                for kw in keywords:
+                    tasks.append(
+                        asyncio.create_task(
+                            scrape_area_keyword(context, area, kw, seen_names, all_results, progress_file, semaphore_outer, semaphore_inner)
+                        )
+                    )
+            
+            # Wait for ALL tasks to complete or fail.
+            await asyncio.gather(*tasks, return_exceptions=True) 
+
+        except KeyboardInterrupt:
+            print("\n⏹️ Interrupted by user, saving current progress...")
+        except Exception as e:
+            print(f"\n❌ An unexpected error occurred in main: {e}")
+        finally:
+            # This block runs only after asyncio.gather() has finished all tasks.
+            print("\nAll scraping tasks completed. Performing final cleanup.")
+            try:
+                await context.close()
+                await browser.close()
+            except Exception as e:
+                print(f"Warning: Failed to close browser/context cleanly: {e}")
+            
+            save_results(final_output_file, all_results)
+            print(f"\n💾 Final results saved to {final_output_file} ({len(all_results)} unique listings)")
+
+if __name__ == "__main__":
+    asyncio.run(main())
